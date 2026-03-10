@@ -1,0 +1,11 @@
+__pycache__/
+.cursor/
+.vscode/
+model_data/
+occwl/
+.idea/
+
+*.log
+*.npz
+*.zip
+*.tar.gz

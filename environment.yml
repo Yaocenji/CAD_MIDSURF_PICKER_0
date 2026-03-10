@@ -1,0 +1,21 @@
+name: picker
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  - numpy
+  - scipy
+  - matplotlib
+  - vtk=9.2.6
+  - pyqt=5
+  - pythonocc-core=7.7.2
+  - pip:
+    - deprecate
+    - PyQt5==5.15.9
+    - pyvista==0.42.3
+    - pyvistaqt==0.11.0
+    - torch
+    - tqdm
