@@ -5,17 +5,17 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import numpy as np
-from scipy.interpolate import bisplrep, bisplev
+from scipy.interpolate import bisplrep, bisplev, UnivariateSpline
 import vtk
 import pyvista as pv
 import matplotlib.colors as mcolors
 from pyvistaqt import BackgroundPlotter
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
                              QPushButton, QLabel, QFileDialog, QHBoxLayout, QTextEdit,
                              QCheckBox, QScrollArea, QFrame, QComboBox, QColorDialog,
-                             QSlider, QDoubleSpinBox)
+                             QSlider, QDoubleSpinBox, QShortcut)
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor, QPalette
+from PyQt5.QtGui import QColor, QPalette, QKeySequence
 
 # occwl imports
 from occwl.compound import Compound
@@ -31,12 +31,18 @@ from OCC.Core.Bnd import Bnd_OBB
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib_Add, brepbndlib_AddOBB
 from OCC.Core.Poly import Poly_Triangulation, Poly_Triangle, Poly_Array1OfTriangle
-from OCC.Core.TColgp import TColgp_Array1OfPnt
-from OCC.Core.gp import gp_Pnt
-from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeShapeOnMesh
-from OCC.Core.TopoDS import TopoDS_Compound
+from OCC.Core.TColgp import TColgp_Array1OfPnt, TColgp_Array2OfPnt
+from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3, gp_Ax1, gp_Ax2
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeShapeOnMesh, BRepBuilderAPI_MakeFace
+from OCC.Core.TopoDS import TopoDS_Compound, TopoDS_Face
+from OCC.Core.GeomAPI import GeomAPI_PointsToBSplineSurface, GeomAPI_PointsToBSpline
+from OCC.Core.GeomAbs import GeomAbs_C2
+from OCC.Core.GC import GC_MakeCylindricalSurface, GC_MakeConicalSurface
+from OCC.Core.Geom import Geom_SphericalSurface, Geom_SurfaceOfRevolution
 from OCC.Core.STEPControl import STEPControl_Writer, STEPControl_AsIs
 from OCC.Core.IFSelect import IFSelect_RetDone
+from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
+from OCC.Core.GeomAbs import GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Sphere, GeomAbs_Torus, GeomAbs_SurfaceOfRevolution
 
 # 预定义的高亮颜色列表 (用于区分不同行的 face 对)
 HIGHLIGHT_COLORS = [
@@ -65,6 +71,9 @@ HIGHLIGHT_COLORS = [
 # 点云显示数量限制：0=无限制，>0 时从 npz 中均匀采样至该数量（避免巨量点导致卡顿）
 POINT_CLOUD_MAX_POINTS = 0
 
+# 概览模式：每个面对最多显示的点数（用于查看朝向，控制性能）
+OVERVIEW_POINTS_PER_PAIR = 500
+
 # 点云 Albedo 映射三端颜色（起始 / 中间 / 结束）
 ALBEDO_COLOR_LOW = np.array([0.0, 0.0, 0.6])    # 蓝
 ALBEDO_COLOR_MID = np.array([0.0, 0.9, 0.3])    # 绿
@@ -73,6 +82,215 @@ ALBEDO_COLOR_HIGH = np.array([1.0, 0.2, 0.2])   # 红
 # 等值面 B-spline 拟合：网格分辨率、平滑参数
 ISOSURFACE_FIT_N_GRID = 50
 ISOSURFACE_FIT_SMOOTHING = None  # None 则自动设为 len(points)*0.1
+
+# 曲面表示：非周期 = B-spline (tck + 局部坐标系)，周期 = 参数化曲面 (圆柱/圆锥/球) 或 周期样条 (periodic_bspline / periodic_revolution)
+# surface 为 dict: type in ("bspline", "cylinder", "cone", "sphere", "periodic_bspline", "periodic_revolution")
+
+
+def extend_bspline_surface(surface, ext_v):
+    """
+    仅对 type=="bspline" 的等值曲面做 UV 延展：扩展量为相对曲面自身 UV 范围的比例。
+    ext_v 为比例系数，每侧扩展量 = (Umax-Umin)*ext_v 或 (Vmax-Vmin)*ext_v。
+    例如 u:[0,2], v:[0,1]，ext_v=0.5 时 dU=2*0.5=1, dV=1*0.5=0.5，延展后 u:[-1,3], v:[-0.5,1.5]。
+    周期面不延展，返回原 surface 的浅拷贝。
+    """
+    if surface is None:
+        return None
+    stype = surface.get("type")
+    if stype != "bspline":
+        return dict(surface)
+    u0, u1 = surface["u_bounds"]
+    v0, v1 = surface["v_bounds"]
+    r = float(ext_v)
+    du = (u1 - u0) * r
+    dv = (v1 - v0) * r
+    out = dict(surface)
+    out["u_bounds"] = (u0 - du, u1 + du)
+    out["v_bounds"] = (v0 - dv, v1 + dv)
+    return out
+
+
+def sample_surface_to_mesh(surface, n_grid=50):
+    """
+    将曲面表示采样为三角网格，用于显示与 STEP 导出。
+    surface: 由各 fit_* 返回的曲面 dict（B-spline 或参数化）。
+    n_grid: 采样分辨率（u/v 方向网格数）。
+
+    Returns:
+        grid_points: (N, 3) 顶点
+        triangles: (K, 3) 三角面片索引
+    若 surface 为 None 或类型未知，返回 (None, None)。
+    """
+    if surface is None:
+        return None, None
+    stype = surface.get("type")
+    if stype == "bspline":
+        tck = surface["tck"]
+        centroid = surface["centroid"]
+        eigenvectors = surface["eigenvectors"]
+        u_bounds = surface["u_bounds"]
+        v_bounds = surface["v_bounds"]
+        u_margin = (u_bounds[1] - u_bounds[0]) * 0.02 or 1e-6
+        v_margin = (v_bounds[1] - v_bounds[0]) * 0.02 or 1e-6
+        u_min, u_max = u_bounds[0] + u_margin, u_bounds[1] - u_margin
+        v_min, v_max = v_bounds[0] + v_margin, v_bounds[1] - v_margin
+        u_grid = np.linspace(u_min, u_max, n_grid)
+        v_grid = np.linspace(v_min, v_max, n_grid)
+        w_grid = bisplev(u_grid, v_grid, tck)
+        grid_points = []
+        for i, u in enumerate(u_grid):
+            for j, v in enumerate(v_grid):
+                local_pt = np.array([u, v, w_grid[i, j]])
+                world_pt = local_pt @ eigenvectors.T + centroid
+                grid_points.append(world_pt)
+        grid_points = np.array(grid_points)
+        triangles = []
+        for i in range(n_grid - 1):
+            for j in range(n_grid - 1):
+                idx = i * n_grid + j
+                triangles.append([idx, idx + 1, idx + n_grid])
+                triangles.append([idx + 1, idx + n_grid + 1, idx + n_grid])
+        triangles = np.array(triangles)
+        return grid_points, triangles
+
+    if stype == "cylinder":
+        origin = surface["origin"]
+        axis_dir = surface["axis_dir"]
+        x_dir, y_dir = surface["x_dir"], surface["y_dir"]
+        radius = surface["radius"]
+        v_min, v_max = surface["v_bounds"]
+        n_u, n_v = n_grid, max(10, n_grid // 2)
+        u_grid = np.linspace(0, 2 * np.pi, n_u, endpoint=False)
+        v_grid = np.linspace(v_min, v_max, n_v)
+        grid_points = []
+        for v in v_grid:
+            for u in u_grid:
+                pt = origin + v * axis_dir + radius * (np.cos(u) * x_dir + np.sin(u) * y_dir)
+                grid_points.append(pt)
+        grid_points = np.array(grid_points)
+        triangles = []
+        for i in range(n_v - 1):
+            for j in range(n_u):
+                jn = (j + 1) % n_u
+                idx = i * n_u + j
+                idx_next = i * n_u + jn
+                idx_up = (i + 1) * n_u + j
+                idx_up_next = (i + 1) * n_u + jn
+                triangles.append([idx, idx_next, idx_up])
+                triangles.append([idx_next, idx_up_next, idx_up])
+        return grid_points, np.array(triangles)
+
+    if stype == "cone":
+        apex = surface["apex"]
+        axis_dir = surface["axis_dir"]
+        x_dir, y_dir = surface["x_dir"], surface["y_dir"]
+        semi_angle = surface["semi_angle"]
+        v_min, v_max = surface["v_bounds"]
+        n_u, n_v = n_grid, max(10, n_grid // 2)
+        u_grid = np.linspace(0, 2 * np.pi, n_u, endpoint=False)
+        v_grid = np.linspace(v_min, v_max, n_v)
+        grid_points = []
+        for v in v_grid:
+            r_at_v = max(abs(v) * np.tan(semi_angle), 1e-9)
+            for u in u_grid:
+                pt = apex + v * axis_dir + r_at_v * (np.cos(u) * x_dir + np.sin(u) * y_dir)
+                grid_points.append(pt)
+        grid_points = np.array(grid_points)
+        triangles = []
+        for i in range(n_v - 1):
+            for j in range(n_u):
+                jn = (j + 1) % n_u
+                idx = i * n_u + j
+                idx_next = i * n_u + jn
+                idx_up = (i + 1) * n_u + j
+                idx_up_next = (i + 1) * n_u + jn
+                triangles.append([idx, idx_next, idx_up])
+                triangles.append([idx_next, idx_up_next, idx_up])
+        return grid_points, np.array(triangles)
+
+    if stype == "sphere":
+        center = surface["center"]
+        radius = surface["radius"]
+        theta_min, theta_max = surface["theta_bounds"]
+        phi_min, phi_max = surface["phi_bounds"]
+        n_theta, n_phi = n_grid, max(10, n_grid // 2)
+        theta_grid = np.linspace(theta_min, theta_max, n_theta)
+        phi_grid = np.linspace(phi_min, phi_max, n_phi)
+        grid_points = []
+        for phi_val in phi_grid:
+            for theta_val in theta_grid:
+                st, ct = np.sin(theta_val), np.cos(theta_val)
+                sp, cp = np.sin(phi_val), np.cos(phi_val)
+                pt = center + radius * np.array([ct * sp, st * sp, cp])
+                grid_points.append(pt)
+        grid_points = np.array(grid_points)
+        triangles = []
+        for i in range(n_phi - 1):
+            for j in range(n_theta - 1):
+                idx = i * n_theta + j
+                triangles.append([idx, idx + 1, idx + n_theta])
+                triangles.append([idx + 1, idx + n_theta + 1, idx + n_theta])
+        return grid_points, np.array(triangles)
+
+    if stype == "periodic_bspline":
+        origin = surface["origin"]
+        axis_dir = surface["axis_dir"]
+        x_dir, y_dir = surface["x_dir"], surface["y_dir"]
+        tck = surface["tck"]
+        v_min, v_max = surface["v_bounds"]
+        n_u, n_v = n_grid, max(20, n_grid)
+        u_grid = np.linspace(0, 2 * np.pi, n_u, endpoint=False)
+        v_grid = np.linspace(v_min, v_max, n_v)
+        r_grid = bisplev(u_grid, v_grid, tck)
+        grid_points = []
+        for i, u in enumerate(u_grid):
+            for j, v in enumerate(v_grid):
+                r = float(np.maximum(r_grid[i, j], 1e-9))
+                pt = origin + v * axis_dir + r * (np.cos(u) * x_dir + np.sin(u) * y_dir)
+                grid_points.append(pt)
+        grid_points = np.array(grid_points)
+        triangles = []
+        for i in range(n_v - 1):
+            for j in range(n_u):
+                jn = (j + 1) % n_u
+                idx = i * n_u + j
+                idx_next = i * n_u + jn
+                idx_up = (i + 1) * n_u + j
+                idx_up_next = (i + 1) * n_u + jn
+                triangles.append([idx, idx_next, idx_up])
+                triangles.append([idx_next, idx_up_next, idx_up])
+        return grid_points, np.array(triangles)
+
+    if stype == "periodic_revolution":
+        origin = surface["origin"]
+        axis_dir = surface["axis_dir"]
+        x_dir, y_dir = surface["x_dir"], surface["y_dir"]
+        r_spline = surface["r_spline"]
+        v_min, v_max = surface["v_bounds"]
+        n_u, n_v = n_grid, max(20, n_grid)
+        u_grid = np.linspace(0, 2 * np.pi, n_u, endpoint=False)
+        v_grid = np.linspace(v_min, v_max, n_v)
+        grid_points = []
+        for v in v_grid:
+            r = float(np.maximum(r_spline(v), 1e-9))
+            for u in u_grid:
+                pt = origin + v * axis_dir + r * (np.cos(u) * x_dir + np.sin(u) * y_dir)
+                grid_points.append(pt)
+        grid_points = np.array(grid_points)
+        triangles = []
+        for i in range(n_v - 1):
+            for j in range(n_u):
+                jn = (j + 1) % n_u
+                idx = i * n_u + j
+                idx_next = i * n_u + jn
+                idx_up = (i + 1) * n_u + j
+                idx_up_next = (i + 1) * n_u + jn
+                triangles.append([idx, idx_next, idx_up])
+                triangles.append([idx_next, idx_up_next, idx_up])
+        return grid_points, np.array(triangles)
+
+    return None, None
+
 
 # Albedo 映射数据源选项
 ALBEDO_DATA_SOURCES = [
@@ -85,21 +303,20 @@ ALBEDO_DATA_SOURCES = [
 
 def fit_nurbs_surface_from_points(points, n_grid=50, smoothing=None):
     """
-    用 B-spline 拟合点云生成 NURBS 曲面（PCA 参数化 + bisplrep）。
-    fit_ref.py 思路：主平面参数化 → bisplrep 拟合 w=f(u,v) → 采样网格。
+    用 B-spline 拟合点云，得到 B-spline 曲面表示（非周期）。
+    fit_ref.py 思路：PCA 主平面参数化 → bisplrep 拟合 w=f(u,v)，曲面以 (tck, 局部坐标系) 表示。
 
     Args:
         points: (M, 3) 待拟合的 3D 点
-        n_grid: 网格分辨率 (n_grid x n_grid)
+        n_grid: 仅用于兼容接口，实际采样由 sample_surface_to_mesh(surface, n_grid) 完成
         smoothing: 平滑参数，None 则自动
 
     Returns:
-        grid_points: (n_grid*n_grid, 3) 拟合曲面上的采样点
-        triangles: (K, 3) 三角面片索引
+        surface: dict type="bspline"（tck, centroid, eigenvectors, u_bounds, v_bounds），或 None
         info: dict 或 None
     """
     if len(points) < 16:
-        return None, None, None
+        return None, None
     centroid = points.mean(axis=0)
     pts_centered = points - centroid
     cov = np.cov(pts_centered.T)
@@ -117,28 +334,397 @@ def fit_nurbs_surface_from_points(points, n_grid=50, smoothing=None):
         try:
             tck = bisplrep(u_coords, v_coords, w_coords, s=len(points) * 1.0, kx=3, ky=3)
         except Exception:
-            return None, None, None
-    u_margin = (u_coords.max() - u_coords.min()) * 0.02 or 1e-6
-    v_margin = (v_coords.max() - v_coords.min()) * 0.02 or 1e-6
-    u_grid = np.linspace(u_coords.min() + u_margin, u_coords.max() - u_margin, n_grid)
-    v_grid = np.linspace(v_coords.min() + v_margin, v_coords.max() - v_margin, n_grid)
-    w_grid = bisplev(u_grid, v_grid, tck)
-    grid_points = []
-    for i, u in enumerate(u_grid):
-        for j, v in enumerate(v_grid):
-            local_pt = np.array([u, v, w_grid[i, j]])
-            world_pt = local_pt @ eigenvectors.T + centroid
-            grid_points.append(world_pt)
-    grid_points = np.array(grid_points)
-    triangles = []
-    for i in range(n_grid - 1):
-        for j in range(n_grid - 1):
-            idx = i * n_grid + j
-            triangles.append([idx, idx + 1, idx + n_grid])
-            triangles.append([idx + 1, idx + n_grid + 1, idx + n_grid])
-    triangles = np.array(triangles)
-    info = {"n_input_points": len(points), "n_grid": n_grid}
-    return grid_points, triangles, info
+            return None, None
+    u_min, u_max = float(np.min(u_coords)), float(np.max(u_coords))
+    v_min, v_max = float(np.min(v_coords)), float(np.max(v_coords))
+    surface = {
+        "type": "bspline",
+        "tck": tck,
+        "centroid": centroid,
+        "eigenvectors": eigenvectors,
+        "u_bounds": (u_min, u_max),
+        "v_bounds": (v_min, v_max),
+    }
+    info = {"n_input_points": len(points), "type": "non-periodic"}
+    return surface, info
+
+
+def _get_face_surface_type(face):
+    """
+    获取 occwl Face 的曲面类型。
+    返回 "cylinder" | "cone" | "periodic" | None（非周期或无法识别）。
+    周期面：Cylinder, Cone, Sphere, Torus, SurfaceOfRevolution。
+    """
+    try:
+        shape = face.topods_shape()
+        adapt = BRepAdaptor_Surface(shape)
+        stype = adapt.GetType()
+        if stype == GeomAbs_Cylinder:
+            return "cylinder"
+        if stype == GeomAbs_Cone:
+            return "cone"
+        if stype == GeomAbs_Sphere:
+            return "sphere"
+        if stype in (GeomAbs_Torus, GeomAbs_SurfaceOfRevolution):
+            return "periodic"
+        return None
+    except Exception:
+        return None
+
+
+def _get_cylinder_params_from_face(face):
+    """从圆柱面 Face 取 (origin, axis_direction, radius)，numpy 数组。失败返回 None。"""
+    try:
+        shape = face.topods_shape()
+        adapt = BRepAdaptor_Surface(shape)
+        if adapt.GetType() != GeomAbs_Cylinder:
+            return None
+        try:
+            cyl = adapt.Cylinder()
+        except Exception:
+            cyl = adapt.Surface().Cylinder()
+        pos = cyl.Position()
+        loc = pos.Location()
+        ax = pos.Direction()
+        origin = np.array([loc.X(), loc.Y(), loc.Z()], dtype=np.float64)
+        axis_dir = np.array([ax.X(), ax.Y(), ax.Z()], dtype=np.float64)
+        axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+        radius = cyl.Radius()
+        return origin, axis_dir, radius
+    except Exception:
+        return None
+
+
+def _get_cone_params_from_face(face):
+    """从圆锥面 Face 取 (apex, axis_direction, semi_angle)，numpy 数组。失败返回 None。"""
+    try:
+        shape = face.topods_shape()
+        adapt = BRepAdaptor_Surface(shape)
+        if adapt.GetType() != GeomAbs_Cone:
+            return None
+        try:
+            cone = adapt.Cone()
+        except Exception:
+            cone = adapt.Surface().Cone()
+        pos = cone.Position()
+        apex = pos.Location()
+        ax = pos.Direction()
+        apex_pt = np.array([apex.X(), apex.Y(), apex.Z()], dtype=np.float64)
+        axis_dir = np.array([ax.X(), ax.Y(), ax.Z()], dtype=np.float64)
+        axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+        semi_angle = cone.SemiAngle()
+        return apex_pt, axis_dir, semi_angle
+    except Exception:
+        return None
+
+
+def _get_sphere_params_from_face(face):
+    """从球面 Face 取 (center, radius)，numpy 数组。失败返回 None。"""
+    try:
+        shape = face.topods_shape()
+        adapt = BRepAdaptor_Surface(shape)
+        if adapt.GetType() != GeomAbs_Sphere:
+            return None
+        try:
+            sph = adapt.Sphere()
+        except Exception:
+            sph = adapt.Surface().Sphere()
+        pos = sph.Position()
+        center = pos.Location()
+        center_pt = np.array([center.X(), center.Y(), center.Z()], dtype=np.float64)
+        radius = sph.Radius()
+        return center_pt, radius
+    except Exception:
+        return None
+
+
+def _get_revolution_axis_from_face(face):
+    """从周期面（旋转面等）取 (origin, axis_direction)。失败返回 None。"""
+    try:
+        shape = face.topods_shape()
+        adapt = BRepAdaptor_Surface(shape)
+        stype = adapt.GetType()
+        if stype == GeomAbs_Cylinder:
+            r = _get_cylinder_params_from_face(face)
+            return (r[0], r[1]) if r else None
+        if stype == GeomAbs_Cone:
+            r = _get_cone_params_from_face(face)
+            return (r[0], r[1]) if r else None
+        if stype == GeomAbs_SurfaceOfRevolution:
+            try:
+                rev = adapt.Surface().Surface()
+            except Exception:
+                rev = adapt.Surface()
+            ax1 = rev.Axis()
+            loc = ax1.Location()
+            direc = ax1.Direction()
+            origin = np.array([loc.X(), loc.Y(), loc.Z()], dtype=np.float64)
+            axis_dir = np.array([direc.X(), direc.Y(), direc.Z()], dtype=np.float64)
+            axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+            return origin, axis_dir
+        if stype in (GeomAbs_Sphere, GeomAbs_Torus):
+            centroid = np.array([0.0, 0.0, 0.0])
+            axis_dir = np.array([0.0, 0.0, 1.0])
+            return centroid, axis_dir
+        return None
+    except Exception:
+        return None
+
+
+def _make_perp_frame(axis_dir):
+    """给定单位向量 axis_dir (z)，返回 (x_dir, y_dir) 单位正交，与 OCC 右手系一致。"""
+    z = np.asarray(axis_dir, dtype=np.float64)
+    z = z / (np.linalg.norm(z) + 1e-12)
+    if abs(z[2]) < 0.9:
+        x = np.cross(z, np.array([0, 0, 1.0]))
+    else:
+        x = np.cross(z, np.array([1.0, 0, 0]))
+    x = x / (np.linalg.norm(x) + 1e-12)
+    y = np.cross(z, x)
+    y = y / (np.linalg.norm(y) + 1e-12)
+    return x, y
+
+
+def fit_cylinder_surface_from_points(points, origin, axis_dir, radius, n_grid=50):
+    """
+    用圆柱面（参数化曲面）拟合点云，中轴与朝向与给定 origin/axis_dir 一致。
+    返回参数化曲面表示 (surface, info)，采样由 sample_surface_to_mesh(surface, n_grid) 完成。
+    """
+    if len(points) < 8:
+        return None, None
+    points = np.asarray(points, dtype=np.float64)
+    axis_dir = np.asarray(axis_dir, dtype=np.float64)
+    axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+    x_dir, y_dir = _make_perp_frame(axis_dir)
+    v_vals = (points - origin) @ axis_dir
+    v_min, v_max = float(np.min(v_vals)), float(np.max(v_vals))
+    if v_max <= v_min:
+        v_max = v_min + 1e-6
+    r_vals = np.linalg.norm((points - origin) - np.outer((points - origin) @ axis_dir, axis_dir), axis=1)
+    r_median = float(np.median(r_vals)) if len(r_vals) else radius
+    r_median = max(r_median, 1e-9)
+    surface = {
+        "type": "cylinder",
+        "origin": origin,
+        "axis_dir": axis_dir,
+        "x_dir": x_dir,
+        "y_dir": y_dir,
+        "radius": r_median,
+        "v_bounds": (v_min, v_max),
+    }
+    info = {"n_input_points": len(points), "type": "cylinder"}
+    return surface, info
+
+
+def fit_sphere_surface_from_points(points, center, radius, n_grid=50):
+    """
+    用球面（参数化曲面）拟合点云，球心与半径与给定 center/radius 一致；半径用点云到球心距离中值微调。
+    参数化：theta (经度), phi (余纬)，仅覆盖点云角范围。采样由 sample_surface_to_mesh(surface, n_grid) 完成。
+    """
+    if len(points) < 8:
+        return None, None
+    points = np.asarray(points, dtype=np.float64)
+    center = np.asarray(center, dtype=np.float64)
+    to_pts = points - center
+    dist = np.linalg.norm(to_pts, axis=1)
+    r_median = float(np.median(dist)) if len(dist) else radius
+    r_median = max(r_median, 1e-9)
+    z = to_pts[:, 2]
+    xy = np.linalg.norm(to_pts[:, :2], axis=1)
+    theta = np.arctan2(to_pts[:, 1], to_pts[:, 0])
+    phi = np.arctan2(xy, z)
+    theta_min, theta_max = float(np.min(theta)), float(np.max(theta))
+    phi_min, phi_max = float(np.min(phi)), float(np.max(phi))
+    if theta_max <= theta_min:
+        theta_max = theta_min + 2 * np.pi
+    if phi_max <= phi_min:
+        phi_max = phi_min + 1e-6
+    surface = {
+        "type": "sphere",
+        "center": center,
+        "radius": r_median,
+        "theta_bounds": (theta_min, theta_max),
+        "phi_bounds": (phi_min, phi_max),
+    }
+    info = {"n_input_points": len(points), "type": "sphere"}
+    return surface, info
+
+
+def fit_cone_surface_from_points(points, apex, axis_dir, semi_angle, n_grid=50):
+    """
+    用圆锥面（参数化曲面）拟合点云，中轴与朝向与给定 apex/axis_dir 一致。
+    返回参数化曲面表示 (surface, info)，采样由 sample_surface_to_mesh(surface, n_grid) 完成。
+    """
+    if len(points) < 8:
+        return None, None
+    points = np.asarray(points, dtype=np.float64)
+    axis_dir = np.asarray(axis_dir, dtype=np.float64)
+    axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+    x_dir, y_dir = _make_perp_frame(axis_dir)
+    to_pts = points - apex
+    v_vals = to_pts @ axis_dir
+    v_min, v_max = float(np.min(v_vals)), float(np.max(v_vals))
+    if v_max <= v_min:
+        v_max = v_min + 1e-6
+    surface = {
+        "type": "cone",
+        "apex": apex,
+        "axis_dir": axis_dir,
+        "x_dir": x_dir,
+        "y_dir": y_dir,
+        "semi_angle": semi_angle,
+        "v_bounds": (v_min, v_max),
+    }
+    info = {"n_input_points": len(points), "type": "cone"}
+    return surface, info
+
+
+def fit_periodic_revolution_from_points(points, origin, axis_dir, n_grid=50):
+    """
+    通用周期面（旋转面）参数化拟合：以给定轴为旋转轴，半径 r(v) 用 1D B-spline 从点云估计。
+    返回参数化曲面表示 (surface, info)，S(u,v)=origin+v*axis_dir+r_spline(v)*(cos(u)*x+sin(u)*y)。
+    采样由 sample_surface_to_mesh(surface, n_grid) 完成。
+    """
+    if len(points) < 16:
+        return None, None
+    points = np.asarray(points, dtype=np.float64)
+    axis_dir = np.asarray(axis_dir, dtype=np.float64)
+    axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+    x_dir, y_dir = _make_perp_frame(axis_dir)
+    v_vals = (points - origin) @ axis_dir
+    r_vals = np.linalg.norm((points - origin) - np.outer((points - origin) @ axis_dir, axis_dir), axis=1)
+    v_min, v_max = float(np.min(v_vals)), float(np.max(v_vals))
+    if v_max <= v_min:
+        v_max = v_min + 1e-6
+    n_v = max(20, min(n_grid, len(points) // 2))
+    v_edges = np.linspace(v_min, v_max, n_v + 1)
+    v_centers = (v_edges[:-1] + v_edges[1:]) / 2
+    r_at_v = []
+    for i in range(n_v):
+        mask = (v_vals >= v_edges[i]) & (v_vals < v_edges[i + 1])
+        if np.any(mask):
+            r_at_v.append(float(np.median(r_vals[mask])))
+        else:
+            r_at_v.append(0.0 if not r_at_v else r_at_v[-1])
+    r_at_v = np.array(r_at_v)
+    r_at_v = np.maximum(r_at_v, 1e-9)
+    try:
+        r_spline = UnivariateSpline(v_centers, r_at_v, k=min(3, n_v - 1), s=0)
+    except Exception:
+        def r_spline(v):
+            return float(np.maximum(np.interp(np.asarray(v, dtype=float), v_centers, r_at_v), 1e-9))
+    surface = {
+        "type": "periodic_revolution",
+        "origin": origin,
+        "axis_dir": axis_dir,
+        "x_dir": x_dir,
+        "y_dir": y_dir,
+        "r_spline": r_spline,
+        "v_bounds": (v_min, v_max),
+    }
+    info = {"n_input_points": len(points), "type": "periodic_revolution"}
+    return surface, info
+
+
+def fit_periodic_spline_surface_from_points(points, origin, axis_dir, n_grid=50, smoothing=None):
+    """
+    非圆柱/圆锥/球的周期面（如 Torus、一般旋转面）：用 scipy 的 bisplrep 做周期性样条曲面拟合。
+    参数化 (u,v)：u 为绕轴角度 [0, 2*pi)，v 为沿轴坐标，拟合 r = r(u,v)。通过复制 u=0/2*pi 两侧数据实现 u 方向周期。
+    参考 fit_ref.py：bisplrep 拟合 → 曲面 S(u,v) = origin + v*axis_dir + r(u,v)*(cos(u)*x_dir + sin(u)*y_dir)。
+    返回 (surface, info)，surface["type"] == "periodic_bspline"。
+    """
+    print("通用周期面拟合")
+
+    if len(points) < 16:
+        return None, None
+    points = np.asarray(points, dtype=np.float64)
+    axis_dir = np.asarray(axis_dir, dtype=np.float64)
+    axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+    x_dir, y_dir = _make_perp_frame(axis_dir)
+    to_origin = points - origin
+    v_vals = to_origin @ axis_dir
+    radial = to_origin - np.outer(v_vals, axis_dir)
+    r_vals = np.linalg.norm(radial, axis=1)
+    r_vals = np.maximum(r_vals, 1e-9)
+    u_vals = np.arctan2(radial @ y_dir, radial @ x_dir)
+    u_vals = np.where(u_vals < 0, u_vals + 2 * np.pi, u_vals)
+    v_min, v_max = float(np.min(v_vals)), float(np.max(v_vals))
+    if v_max <= v_min:
+        v_max = v_min + 1e-6
+    u_ext = np.concatenate([u_vals, u_vals + 2 * np.pi, u_vals - 2 * np.pi])
+    v_ext = np.concatenate([v_vals, v_vals, v_vals])
+    r_ext = np.concatenate([r_vals, r_vals, r_vals])
+    if smoothing is None:
+        smoothing = len(points) * 0.1
+    try:
+        tck = bisplrep(u_ext, v_ext, r_ext, s=smoothing, kx=3, ky=3)
+    except Exception:
+        try:
+            tck = bisplrep(u_ext, v_ext, r_ext, s=len(points) * 1.0, kx=3, ky=3)
+        except Exception:
+            return None, None
+    surface = {
+        "type": "periodic_bspline",
+        "origin": origin,
+        "axis_dir": axis_dir,
+        "x_dir": x_dir,
+        "y_dir": y_dir,
+        "tck": tck,
+        "u_bounds": (0.0, 2 * np.pi),
+        "v_bounds": (v_min, v_max),
+    }
+    info = {"n_input_points": len(points), "type": "periodic_bspline"}
+    return surface, info
+
+
+def fit_isosurface_by_face_type(points, left_face, right_face, n_grid=50):
+    """
+    根据左右面类型选择拟合方式：双圆柱->圆柱参数化，双圆锥->圆锥参数化，双球面->球面参数化，
+    双周期(非圆柱圆锥球)->通用旋转面参数化，否则->非周期 B-spline 曲面。
+    left_face, right_face 为 occwl Face 或 None（无模型时）。
+    返回 (surface, info)：surface 为 B-spline 或参数化曲面 dict，采样由 sample_surface_to_mesh(surface, n_grid) 得到网格。
+    """
+    if left_face is None or right_face is None:
+        return fit_nurbs_surface_from_points(points, n_grid=n_grid)
+    t_left = _get_face_surface_type(left_face)
+    t_right = _get_face_surface_type(right_face)
+    if t_left != t_right:
+        return fit_nurbs_surface_from_points(points, n_grid=n_grid)
+    if t_left == "cylinder":
+        params_left = _get_cylinder_params_from_face(left_face)
+        params_right = _get_cylinder_params_from_face(right_face)
+        if params_left is not None:
+            origin, axis_dir, radius = params_left
+            return fit_cylinder_surface_from_points(points, origin, axis_dir, radius, n_grid)
+        if params_right is not None:
+            origin, axis_dir, radius = params_right
+            return fit_cylinder_surface_from_points(points, origin, axis_dir, radius, n_grid)
+    if t_left == "cone":
+        params_left = _get_cone_params_from_face(left_face)
+        params_right = _get_cone_params_from_face(right_face)
+        if params_left is not None:
+            apex, axis_dir, semi_angle = params_left
+            return fit_cone_surface_from_points(points, apex, axis_dir, semi_angle, n_grid)
+        if params_right is not None:
+            apex, axis_dir, semi_angle = params_right
+            return fit_cone_surface_from_points(points, apex, axis_dir, semi_angle, n_grid)
+    if t_left == "sphere":
+        params_left = _get_sphere_params_from_face(left_face)
+        params_right = _get_sphere_params_from_face(right_face)
+        if params_left is not None:
+            center, radius = params_left
+            return fit_sphere_surface_from_points(points, center, radius, n_grid)
+        if params_right is not None:
+            center, radius = params_right
+            return fit_sphere_surface_from_points(points, center, radius, n_grid)
+    if t_left == "periodic":
+        axis_left = _get_revolution_axis_from_face(left_face)
+        axis_right = _get_revolution_axis_from_face(right_face)
+        origin, axis_dir = (axis_left or axis_right or (np.zeros(3), np.array([0, 0, 1.0])))
+        if axis_left is None and axis_right is None:
+            return fit_nurbs_surface_from_points(points, n_grid=n_grid)
+        return fit_periodic_spline_surface_from_points(points, origin, axis_dir, n_grid=n_grid)
+    return fit_nurbs_surface_from_points(points, n_grid=n_grid)
 
 
 def polydata_to_occ_shape(grid_points, triangles):
@@ -162,6 +748,155 @@ def polydata_to_occ_shape(grid_points, triangles):
     if not builder.IsDone():
         return None
     return builder.Shape()
+
+
+# 采样网格分辨率，用于将 B-spline/周期样条转为 OCC 点阵再拟合成 OCC 曲面
+OCC_SURFACE_APPROX_GRID = 40
+
+
+def _surface_to_points_2d(surface, n_approx):
+    """将 surface 采样为网格点，返回 (points_2d, u_min, u_max, v_min, v_max)。用于转为 OCC TColgp_Array2OfPnt。"""
+    grid_points, _ = sample_surface_to_mesh(surface, n_grid=n_approx)
+    if grid_points is None:
+        return None, None, None, None, None
+    stype = surface.get("type")
+    if stype == "bspline":
+        nu = nv = n_approx
+        pts = grid_points.reshape(nu, nv, 3)
+        u_bounds = surface["u_bounds"]
+        v_bounds = surface["v_bounds"]
+        u_margin = (u_bounds[1] - u_bounds[0]) * 0.02 or 1e-6
+        v_margin = (v_bounds[1] - v_bounds[0]) * 0.02 or 1e-6
+        u_min = u_bounds[0] + u_margin
+        u_max = u_bounds[1] - u_margin
+        v_min = v_bounds[0] + v_margin
+        v_max = v_bounds[1] - v_margin
+        return pts, u_min, u_max, v_min, v_max
+    if stype in ("cylinder", "cone", "periodic_bspline", "periodic_revolution"):
+        v_min, v_max = surface["v_bounds"]
+        n_u_act = n_approx
+        n_v_act = len(grid_points) // n_u_act
+        if n_v_act < 2:
+            return None, None, None, None, None
+        pts = grid_points.reshape(n_v_act, n_u_act, 3)
+        return pts, 0.0, 2 * np.pi, v_min, v_max
+    if stype == "sphere":
+        theta_min, theta_max = surface["theta_bounds"]
+        phi_min, phi_max = surface["phi_bounds"]
+        n_theta = n_approx
+        n_phi = len(grid_points) // n_theta
+        if n_phi < 2:
+            return None, None, None, None, None
+        pts = grid_points.reshape(n_phi, n_theta, 3)
+        return pts, theta_min, theta_max, phi_min, phi_max
+    return None, None, None, None, None
+
+
+def surface_to_occ_face(surface, n_approx=OCC_SURFACE_APPROX_GRID):
+    """
+    将内部曲面表示（B-spline 或参数化）转为 OCC TopoDS_Face（B-spline 或解析曲面），用于 STEP 导出。
+    解析曲面（圆柱、圆锥、球）直接构造 OCC 几何；B-spline/周期样条先采样再 GeomAPI_PointsToBSplineSurface 近似。
+    失败返回 None。
+    """
+    if surface is None:
+        return None
+    stype = surface.get("type")
+    try:
+        if stype == "cylinder":
+            origin = np.asarray(surface["origin"], dtype=np.float64)
+            axis_dir = np.asarray(surface["axis_dir"], dtype=np.float64)
+            axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+            x_dir = np.asarray(surface["x_dir"], dtype=np.float64)
+            radius = float(surface["radius"])
+            v_min, v_max = surface["v_bounds"]
+            ax2 = gp_Ax2(gp_Pnt(origin[0], origin[1], origin[2]), gp_Dir(axis_dir[0], axis_dir[1], axis_dir[2]))
+            result = GC_MakeCylindricalSurface(ax2, radius)
+            if not result.IsDone():
+                return None
+            geom = result.Value()
+            face_builder = BRepBuilderAPI_MakeFace(geom, 0.0, 2 * np.pi, v_min, v_max, 1e-6)
+            if not face_builder.IsDone():
+                return None
+            return face_builder.Face()
+
+        if stype == "cone":
+            apex = np.asarray(surface["apex"], dtype=np.float64)
+            axis_dir = np.asarray(surface["axis_dir"], dtype=np.float64)
+            axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+            semi_angle = float(surface["semi_angle"])
+            v_min, v_max = surface["v_bounds"]
+            ax2 = gp_Ax2(gp_Pnt(apex[0], apex[1], apex[2]), gp_Dir(axis_dir[0], axis_dir[1], axis_dir[2]))
+            result = GC_MakeConicalSurface(ax2, semi_angle, 1e-9)
+            if not result.IsDone():
+                return None
+            geom = result.Value()
+            face_builder = BRepBuilderAPI_MakeFace(geom, 0.0, 2 * np.pi, v_min, v_max, 1e-6)
+            if not face_builder.IsDone():
+                return None
+            return face_builder.Face()
+
+        if stype == "sphere":
+            center = np.asarray(surface["center"], dtype=np.float64)
+            radius = float(surface["radius"])
+            theta_min, theta_max = surface["theta_bounds"]
+            phi_min, phi_max = surface["phi_bounds"]
+            ax3 = gp_Ax3(gp_Pnt(center[0], center[1], center[2]), gp_Dir(0, 0, 1))
+            geom = Geom_SphericalSurface(ax3, radius)
+            face_builder = BRepBuilderAPI_MakeFace(geom, theta_min, theta_max, phi_min, phi_max, 1e-6)
+            if not face_builder.IsDone():
+                return None
+            return face_builder.Face()
+
+        if stype == "periodic_revolution":
+            origin = np.asarray(surface["origin"], dtype=np.float64)
+            axis_dir = np.asarray(surface["axis_dir"], dtype=np.float64)
+            axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+            x_dir = np.asarray(surface["x_dir"], dtype=np.float64)
+            r_spline = surface["r_spline"]
+            v_min, v_max = surface["v_bounds"]
+            n_curve = max(20, n_approx)
+            v_vals = np.linspace(v_min, v_max, n_curve)
+            curve_pts = [origin + v * axis_dir + max(float(r_spline(v)), 1e-9) * x_dir for v in v_vals]
+            pts_arr = TColgp_Array1OfPnt(1, n_curve)
+            for i, pt in enumerate(curve_pts):
+                pts_arr.SetValue(i + 1, gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])))
+            curve_builder = GeomAPI_PointsToBSpline(pts_arr, 3, 8)
+            if not curve_builder.IsDone():
+                return None
+            meridian = curve_builder.Curve()
+            ax1 = gp_Ax1(gp_Pnt(origin[0], origin[1], origin[2]), gp_Dir(axis_dir[0], axis_dir[1], axis_dir[2]))
+            geom = Geom_SurfaceOfRevolution(meridian, ax1)
+            cv_min = meridian.FirstParameter()
+            cv_max = meridian.LastParameter()
+            face_builder = BRepBuilderAPI_MakeFace(geom, 0.0, 2 * np.pi, cv_min, cv_max, 1e-6)
+            if not face_builder.IsDone():
+                return None
+            return face_builder.Face()
+
+        if stype in ("bspline", "periodic_bspline"):
+            # 对 B-spline/周期样条曲面：用规则网格采样 + GeomAPI_PointsToBSplineSurface 近似成 OCC 的 Geom_BSplineSurface，
+            # 然后用自然 UV 范围创建 Face（不再用 Python 侧 PCA 的 u/v 范围去裁剪，避免参数域不一致导致的导出问题）。
+            pts_2d, _, _, _, _ = _surface_to_points_2d(surface, n_approx)
+            if pts_2d is None:
+                return None
+            nu, nv = pts_2d.shape[0], pts_2d.shape[1]
+            arr = TColgp_Array2OfPnt(1, nu, 1, nv)
+            for i in range(nu):
+                for j in range(nv):
+                    p = pts_2d[i, j]
+                    arr.SetValue(i + 1, j + 1, gp_Pnt(float(p[0]), float(p[1]), float(p[2])))
+            approx = GeomAPI_PointsToBSplineSurface(arr, 3, 8, GeomAbs_C2, 1.0e-3)
+            if not approx.IsDone():
+                return None
+            geom = approx.Surface()
+            # 使用自然参数域构造 Face，避免与 Python 侧 PCA u/v 范围不一致
+            face_builder = BRepBuilderAPI_MakeFace(geom, 1.0e-6)
+            if not face_builder.IsDone():
+                return None
+            return face_builder.Face()
+    except Exception:
+        return None
+    return None
 
 
 def compute_obb_for_faces(step_path, left_tag, right_tag):
@@ -456,6 +1191,7 @@ class FaceHighlighterWindow(QMainWindow):
         self.face_id_to_edge_actor = {}  # face_id -> edge_actor (边界线)
         self.highlight_groups = []  # [(color, [face_ids]), ...]
         self.group_checkboxes = []  # [QCheckBox, ...]
+        self.flip_checkboxes = []   # 每行一个“左右反转”checkbox，勾选时交换面对顺序并取反 offset
         
         # 配置文件与面对 (用于 npz 查找)
         self.config_dir = None
@@ -474,7 +1210,8 @@ class FaceHighlighterWindow(QMainWindow):
         
         # 镜头 target 管理
         self.model_center = None  # 模型几何中心，首次配置加载时设置
-        self._prev_solo_value = 0  # 用于检测滑条 0->1 或 1->0 的切换
+        self._prev_solo_value = 0  # 用于检测渲染模式切换（镜头 target 等）
+        self.overview_point_cloud_actors = []  # 概览模式下各面对的点云 actor
         
         # Solo 模式(滑条=1)下左右面自定义颜色与透明度
         self.solo_left_color = np.array([0.2, 0.6, 1.0])   # 左面默认蓝
@@ -489,15 +1226,17 @@ class FaceHighlighterWindow(QMainWindow):
         
         # 等值面拟合（当前为筛选显示）：offset 数据源、等值、容差、颜色透明度
         self.isosurface_offset_source = "offset_pred"  # "offset_pred" | "offset_gt"
-        self.isosurface_offset_value = 0.0
-        self.isosurface_tolerance = 0.05
+        self.isosurface_offset_value = 0.5
+        self.isosurface_tolerance = 0.02
         self.isosurface_color = np.array([0.2, 0.8, 0.4])  # 绿
         self.isosurface_opacity = 1.0
         self.isosurface_filter_active = False  # 筛选显示开关
-        self.isosurface_surface_actor = None  # 拟合曲面 actor，可移除
+        self.isosurface_new_behavior = False  # True=新行为(offset!=0.5 时双区间两次操作)，False=旧行为(始终单区间一次操作)
+        self.isosurface_ext_v = 0.0  # B-spline 延展比例：每侧扩展量 = (UV范围)*ext_v，仅对 type=bspline 生效
+        self.isosurface_surface_actors = []  # 单次拟合的曲面 actor 列表（新行为下可有两个）
         self.batch_isosurface_actors = []  # 批量拟合的曲面 actors
-        self.batch_isosurface_meshes = []  # 批量拟合的网格 (grid_points, triangles)，用于 STEP 导出
-        self.batch_fit_done = False  # 批量拟合是否已完成（导出按钮前置）
+        self.batch_isosurface_meshes = []  # 批量拟合: (surface, grid_points, triangles)，渲染用 mesh，导出用 surface 转 OCC 曲面
+        self.batch_fit_done = False  # 批量拟合是否已完成（导出/延展按钮前置）
         
         # 模型边线：世界空间粗细(相对模型尺寸)、颜色，albedo unlit
         self.model_extent = 1.0  # 模型包围盒对角线，用于线粗参考
@@ -505,7 +1244,7 @@ class FaceHighlighterWindow(QMainWindow):
         self.edge_line_color = np.array([0.0, 0.0, 0.0])  # 黑
         
         # OBB 框线（solo mode）：世界空间粗细、颜色，albedo unlit
-        self.obb_line_radius_scale = 0.0005
+        self.obb_line_radius_scale = 0.005
         self.obb_line_color = np.array([0.8, 0.2, 0.2])  # 红
         
         # Model 模式默认颜色与透明度（HIGHLIGHT/STF/Solo 覆盖时不用）
@@ -601,8 +1340,14 @@ class FaceHighlighterWindow(QMainWindow):
         self.btn_deselect_all = QPushButton("取消全选")
         self.btn_deselect_all.clicked.connect(self.deselect_all_groups)
         select_btn_layout.addWidget(self.btn_deselect_all)
+        self.btn_flip_current_pair = QPushButton("取反当前面对")
+        self.btn_flip_current_pair.setToolTip("对当前选中的面对做左右反转并 offset→1-offset（Ctrl+Shift+F）")
+        self.btn_flip_current_pair.clicked.connect(self._flip_current_pair)
+        select_btn_layout.addWidget(self.btn_flip_current_pair)
         add_left(select_btn_layout)
-        
+        self._shortcut_flip_pair = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
+        self._shortcut_flip_pair.activated.connect(self._flip_current_pair)
+
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.NoFrame)
@@ -619,18 +1364,15 @@ class FaceHighlighterWindow(QMainWindow):
         lbl_solo.setStyleSheet("font-size: 12px; font-weight: bold;")
         add_left(lbl_solo)
         solo_layout = QHBoxLayout()
-        solo_layout.addWidget(QLabel("0"))
-        self.slider_solo = QSlider(Qt.Horizontal)
-        self.slider_solo.setMinimum(0)
-        self.slider_solo.setMaximum(1)
-        self.slider_solo.setValue(0)
-        self.slider_solo.setTickPosition(QSlider.TicksBelow)
-        self.slider_solo.setTickInterval(1)
-        self.slider_solo.valueChanged.connect(self._on_solo_slider_changed)
-        solo_layout.addWidget(self.slider_solo)
-        solo_layout.addWidget(QLabel("1"))
+        self.combo_render_mode = QComboBox()
+        self.combo_render_mode.addItem("Model (全部)", 0)
+        self.combo_render_mode.addItem("Solo (仅当前面)", 1)
+        self.combo_render_mode.addItem("概览 (全部面对点云)", 2)
+        self.combo_render_mode.setCurrentIndex(0)
+        self.combo_render_mode.currentIndexChanged.connect(self._on_render_mode_changed)
+        solo_layout.addWidget(self.combo_render_mode)
         add_left(solo_layout)
-        self.lbl_solo_hint = QLabel("左(0)=全部 | 右(1)=仅当前面")
+        self.lbl_solo_hint = QLabel("Model=全部面 | Solo=仅当前面 | 概览=全部面对点云+选中OBB")
         self.lbl_solo_hint.setStyleSheet("font-size: 10px; color: #666;")
         add_left(self.lbl_solo_hint)
         
@@ -799,7 +1541,7 @@ class FaceHighlighterWindow(QMainWindow):
         self.spin_obb_radius = QDoubleSpinBox()
         self.spin_obb_radius.setRange(0.00001, 0.01)
         self.spin_obb_radius.setSingleStep(0.0001)
-        self.spin_obb_radius.setValue(0.0005)
+        self.spin_obb_radius.setValue(0.005)
         self.spin_obb_radius.setDecimals(5)
         self.spin_obb_radius.valueChanged.connect(self._on_obb_radius_changed)
         obb_row.addWidget(self.spin_obb_radius)
@@ -851,7 +1593,7 @@ class FaceHighlighterWindow(QMainWindow):
         iso_offset_layout.addWidget(QLabel("等值:"))
         self.spin_isosurface_offset = QDoubleSpinBox()
         self.spin_isosurface_offset.setRange(-10.0, 10.0)
-        self.spin_isosurface_offset.setValue(0.0)
+        self.spin_isosurface_offset.setValue(0.5)
         self.spin_isosurface_offset.setSingleStep(0.01)
         self.spin_isosurface_offset.setDecimals(4)
         self.spin_isosurface_offset.valueChanged.connect(self._on_isosurface_offset_changed)
@@ -861,7 +1603,7 @@ class FaceHighlighterWindow(QMainWindow):
         iso_tol_layout.addWidget(QLabel("Tol:"))
         self.spin_isosurface_tolerance = QDoubleSpinBox()
         self.spin_isosurface_tolerance.setRange(0.0, 10.0)
-        self.spin_isosurface_tolerance.setValue(0.05)
+        self.spin_isosurface_tolerance.setValue(0.02)
         self.spin_isosurface_tolerance.setSingleStep(0.01)
         self.spin_isosurface_tolerance.setDecimals(4)
         self.spin_isosurface_tolerance.valueChanged.connect(self._on_isosurface_tolerance_changed)
@@ -883,6 +1625,10 @@ class FaceHighlighterWindow(QMainWindow):
         iso_color_layout.addWidget(self.lbl_isosurface_opacity)
         add_right(iso_color_layout)
         iso_btn_layout = QHBoxLayout()
+        self.chk_isosurface_new_behavior = QCheckBox("新行为(双区间)")
+        self.chk_isosurface_new_behavior.setChecked(False)
+        self.chk_isosurface_new_behavior.stateChanged.connect(self._on_isosurface_new_behavior_changed)
+        iso_btn_layout.addWidget(self.chk_isosurface_new_behavior)
         self.btn_isosurface_filter = QPushButton("筛选")
         self.btn_isosurface_filter.setCheckable(True)
         self.btn_isosurface_filter.setChecked(False)
@@ -899,7 +1645,22 @@ class FaceHighlighterWindow(QMainWindow):
         self.btn_export_midsurf.setEnabled(False)
         self.btn_export_midsurf.clicked.connect(self._export_midsurf_step)
         add_right(self.btn_export_midsurf)
-        
+        # B-spline 延展：extV 滑条 (0~1) + 延展按钮（仅批量拟合后可按）
+        iso_ext_layout = QHBoxLayout()
+        iso_ext_layout.addWidget(QLabel("extV:"))
+        self.slider_isosurface_ext_v = QSlider(Qt.Horizontal)
+        self.slider_isosurface_ext_v.setMinimum(0)
+        self.slider_isosurface_ext_v.setMaximum(50)
+        self.slider_isosurface_ext_v.setValue(0)
+        self.slider_isosurface_ext_v.valueChanged.connect(self._on_isosurface_ext_v_changed)
+        iso_ext_layout.addWidget(self.slider_isosurface_ext_v)
+        self.lbl_isosurface_ext_v = QLabel("0.00")
+        iso_ext_layout.addWidget(self.lbl_isosurface_ext_v)
+        self.btn_isosurface_extend = QPushButton("延展")
+        self.btn_isosurface_extend.setEnabled(False)
+        self.btn_isosurface_extend.clicked.connect(self._on_isosurface_extend_clicked)
+        iso_ext_layout.addWidget(self.btn_isosurface_extend)
+        add_right(iso_ext_layout)
         info_main.addWidget(col_left)
         info_main.addWidget(col_right)
         
@@ -1038,6 +1799,7 @@ class FaceHighlighterWindow(QMainWindow):
         self.point_cloud_actors = []
         self.point_cloud_data = None
         self.current_face_pair = None
+        self.overview_point_cloud_actors = []
         self.plotter.enable_lightkit()
         self.face_id_to_actor = {}
         self.actor_to_face_id = {}
@@ -1107,14 +1869,21 @@ class FaceHighlighterWindow(QMainWindow):
         self._apply_solo_mode()
         self.plotter.reset_camera()
 
-    def _on_solo_slider_changed(self, value):
-        """滑条值变化时更新渲染模式和镜头 target"""
+    def _on_render_mode_changed(self, index):
+        """渲染模式(0=Model/1=Solo/2=概览)变化时更新显示与镜头 target"""
         prev = self._prev_solo_value
-        self._prev_solo_value = value
-        
-        # 镜头 target 管理：仅在切换时刻更新
+        self._prev_solo_value = index
+        value = index
+
+        # 概览模式：进入时创建全部面对点云，离开时清除
+        if value == 2:
+            self._clear_point_cloud_actors_only()
+            self._create_overview_point_clouds()
+        elif prev == 2:
+            self._clear_overview_point_clouds()
+
+        # 镜头 target 管理
         if prev == 0 and value == 1:
-            # 滑条从 0 滑向 1：target 设为左右面 OBB 几何中心
             if self.current_face_pair and self.config_dir and self.config_name:
                 step_path = os.path.join(self.config_dir, f"{self.config_name}.step")
                 try:
@@ -1125,7 +1894,6 @@ class FaceHighlighterWindow(QMainWindow):
                 except Exception as e:
                     print(f"设置 OBB target 失败: {e}")
         elif prev == 1 and value == 0:
-            # 滑条从 1 滑回 0：target 设回模型几何中心
             self._set_camera_target(self.model_center)
         if value == 1:
             self.stf_mode = False
@@ -1138,11 +1906,12 @@ class FaceHighlighterWindow(QMainWindow):
 
     def _apply_solo_mode(self):
         """
-        根据滑条值(0/1)和当前选中的面对，控制面的显示/隐藏及颜色。
-        - 滑条=0: 显示所有面，model 边线，无 OBB
-        - 滑条=1: 仅显示当前左右面，solo 边线，OBB 框
+        根据渲染模式(0=Model / 1=Solo / 2=概览)和当前选中的面对，控制面的显示/隐藏及颜色。
+        - 0: 显示所有面，model 边线，OBB 随当前面对
+        - 1: 仅显示当前左右面，solo 边线，OBB 框
+        - 2: 显示所有面 + 全部面对点云，model 边线，仅当前面对 OBB
         """
-        solo = self.slider_solo.value() if hasattr(self, "slider_solo") else 0
+        solo = self.combo_render_mode.currentIndex() if hasattr(self, "combo_render_mode") else 0
         show_ids = None
         if solo == 1 and self.current_face_pair:
             left_id, right_id = self.current_face_pair
@@ -1314,22 +2083,20 @@ class FaceHighlighterWindow(QMainWindow):
             self.solo_edge_actor.SetVisibility(show_edges)
 
     def apply_highlights(self, face_tag_groups):
-        """应用高亮颜色到指定的面，并创建可交互的 checkbox 列表"""
+        """应用高亮颜色到指定的面，并创建可交互的 checkbox 列表；每行增加“左右反转”checkbox"""
         self.highlight_groups = []
         self.group_checkboxes = []
-        
+        self.flip_checkboxes = []
+
         # 清除旧的 checkbox
         while self.scroll_layout.count():
             item = self.scroll_layout.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
-        
+
         for i, tags in enumerate(face_tag_groups):
-            # 循环使用颜色
             color = HIGHLIGHT_COLORS[i % len(HIGHLIGHT_COLORS)]
-            
-            # 高亮这一组的所有面
             valid_tags = []
             for tag in tags:
                 if tag in self.face_id_to_actor:
@@ -1338,12 +2105,10 @@ class FaceHighlighterWindow(QMainWindow):
                     valid_tags.append(tag)
                 else:
                     print(f"警告: Face tag {tag} 不存在")
-            
+
             if valid_tags:
                 group_index = len(self.highlight_groups)
                 self.highlight_groups.append((color, valid_tags))
-                
-                # 创建 checkbox
                 tags_str = ", ".join(map(str, valid_tags))
                 cb = QCheckBox(f"第 {i+1} 组: [{tags_str}]")
                 cb.setChecked(True)
@@ -1353,12 +2118,85 @@ class FaceHighlighterWindow(QMainWindow):
                     f"QCheckBox::indicator:unchecked {{ background-color: #d0d0d0; border: 1px solid #999; }}"
                     f"QCheckBox::indicator {{ width: 14px; height: 14px; }}"
                 )
-                # 用默认参数捕获当前 group_index
                 cb.toggled.connect(lambda checked, idx=group_index: self.on_group_toggled(idx, checked))
-                self.scroll_layout.addWidget(cb)
+
+                flip_cb = QCheckBox("反")
+                flip_cb.setChecked(False)
+                flip_cb.setToolTip("勾选：反转该面对左右顺序，并对当前点云 offset 做 1-offset")
+                flip_cb.stateChanged.connect(lambda state, idx=group_index: self._on_flip_pair_toggled(idx, state == Qt.Checked))
+
+                row_widget = QWidget()
+                row_layout = QHBoxLayout()
+                row_layout.setContentsMargins(0, 2, 0, 2)
+                row_layout.addWidget(cb)
+                row_layout.addWidget(flip_cb)
+                row_layout.addStretch()
+                row_widget.setLayout(row_layout)
+                self.scroll_layout.addWidget(row_widget)
                 self.group_checkboxes.append(cb)
-        
+                self.flip_checkboxes.append(flip_cb)
         self.plotter.render()
+
+    def _get_row_index_for_pair(self, left_id, right_id):
+        """返回 face_tag_groups 中与 (left_id, right_id) 或 (right_id, left_id) 匹配的行索引，无则返回 None"""
+        if not getattr(self, "face_tag_groups", None):
+            return None
+        for i, tags in enumerate(self.face_tag_groups):
+            if len(tags) != 2:
+                continue
+            if (int(tags[0]), int(tags[1])) == (int(left_id), int(right_id)) or (
+                int(tags[0]), int(tags[1])
+            ) == (int(right_id), int(left_id)):
+                return i
+        return None
+
+    def _flip_current_pair(self):
+        """对当前选中的面对执行取反：找到对应行的“反”checkbox 并切换，从而触发左右交换与 offset 取反"""
+        if not self.current_face_pair or not getattr(self, "face_tag_groups", None):
+            if hasattr(self, "lbl_info"):
+                self.lbl_info.setText("请先选中一个面对（点击面加载点云）")
+            return
+        row_i = self._get_row_index_for_pair(self.current_face_pair[0], self.current_face_pair[1])
+        if row_i is None or row_i >= len(getattr(self, "flip_checkboxes", [])):
+            if hasattr(self, "lbl_info"):
+                self.lbl_info.setText("当前面对不在高亮列表中")
+            return
+        flip_cb = self.flip_checkboxes[row_i]
+        flip_cb.setChecked(not flip_cb.isChecked())
+        if hasattr(self, "lbl_info"):
+            self.lbl_info.setText("已取反当前面对（左右顺序与 offset 已更新）")
+
+    def _on_flip_pair_toggled(self, row_index, checked):
+        """每行“反”checkbox 勾选时：1）反转该面对的左右 idx；2）若当前点云是该面对则对 offset 做 1-offset"""
+        if row_index >= len(self.face_tag_groups) or row_index >= len(self.highlight_groups):
+            return
+        tags = list(self.face_tag_groups[row_index])
+        new_tags = [tags[1], tags[0]]
+        self.face_tag_groups[row_index] = new_tags
+        color, valid_tags = self.highlight_groups[row_index]
+        new_valid = [valid_tags[1], valid_tags[0]]
+        self.highlight_groups[row_index] = (color, new_valid)
+        if row_index < len(self.group_checkboxes):
+            self.group_checkboxes[row_index].setText(
+                f"第 {row_index+1} 组: [{new_tags[0]}, {new_tags[1]}]"
+            )
+        # 若当前加载的点云正是该面对，则对 offset 取反并刷新显示
+        if self.current_face_pair and self.point_cloud_data:
+            a, b = tags[0], tags[1]
+            if (self.current_face_pair[0], self.current_face_pair[1]) == (a, b) or (
+                self.current_face_pair[0], self.current_face_pair[1]
+            ) == (b, a):
+                for key in ("offset_pred", "offset_gt"):
+                    if key in self.point_cloud_data:
+                        arr = np.asarray(self.point_cloud_data[key], dtype=np.float64)
+                        self.point_cloud_data[key] = 1.0 - arr
+                self.current_face_pair = tuple(new_tags)
+                self._refresh_point_cloud_display()
+                if self.isosurface_surface_actors or self.batch_fit_done:
+                    self.plotter.render()
+        # 概览模式：取反该面对时，仅对该面对的代表性点云实时重新着色
+        if getattr(self, "combo_render_mode", None) is not None and self.combo_render_mode.currentIndex() == 2:
+            self._recolor_overview_pair(row_index)
 
     def on_group_toggled(self, group_index, checked):
         """当某一组的 checkbox 状态改变时，切换该组的高亮显示"""
@@ -1394,9 +2232,10 @@ class FaceHighlighterWindow(QMainWindow):
 
         self.highlight_groups = []
         self.group_checkboxes = []
+        self.flip_checkboxes = []
         self._clear_point_cloud()
         self._remove_batch_isosurfaces()
-        
+
         # 清除 checkbox 列表
         while self.scroll_layout.count():
             item = self.scroll_layout.takeAt(0)
@@ -1750,8 +2589,9 @@ class FaceHighlighterWindow(QMainWindow):
             self._update_isosurface_color_button()
             if self.isosurface_filter_active:
                 self._refresh_point_cloud_display()
-            if self.isosurface_surface_actor is not None:
-                self.isosurface_surface_actor.prop.color = tuple(self.isosurface_color.tolist())
+            for actor in self.isosurface_surface_actors:
+                actor.prop.color = tuple(self.isosurface_color.tolist())
+            if self.isosurface_surface_actors:
                 self.plotter.render()
 
     def _on_isosurface_source_changed(self, idx):
@@ -1770,15 +2610,62 @@ class FaceHighlighterWindow(QMainWindow):
         if self.isosurface_filter_active:
             self._refresh_point_cloud_display()
 
+    def _on_isosurface_new_behavior_changed(self, state):
+        """新行为(双区间) checkbox：勾选=新行为，不勾选=旧行为"""
+        self.isosurface_new_behavior = state == Qt.Checked
+
     def _on_isosurface_opacity_changed(self, value):
         self.isosurface_opacity = value / 100.0
         if hasattr(self, "lbl_isosurface_opacity"):
             self.lbl_isosurface_opacity.setText(f"{self.isosurface_opacity:.2f}")
         if self.isosurface_filter_active:
             self._refresh_point_cloud_display()
-        if self.isosurface_surface_actor is not None:
-            self.isosurface_surface_actor.prop.opacity = self.isosurface_opacity
+        for actor in self.isosurface_surface_actors:
+            actor.prop.opacity = self.isosurface_opacity
+        if self.isosurface_surface_actors:
             self.plotter.render()
+
+    def _on_isosurface_ext_v_changed(self, value):
+        """extV 滑条 (0~100) 映射为 0~1"""
+        self.isosurface_ext_v = value / 100.0
+        if hasattr(self, "lbl_isosurface_ext_v"):
+            self.lbl_isosurface_ext_v.setText(f"{self.isosurface_ext_v:.2f}")
+
+    def _on_isosurface_extend_clicked(self):
+        """对批量拟合结果中 type=bspline 的等值曲面做 UV 延展，并刷新显示"""
+        if not self.batch_fit_done or not self.batch_isosurface_meshes:
+            return
+        ext_v = getattr(self, "isosurface_ext_v", 0.0)
+        if ext_v <= 0:
+            self.lbl_info.setText("延展: extV 需大于 0")
+            return
+        extended_count = 0
+        for idx, item in enumerate(self.batch_isosurface_meshes):
+            surface, grid_points, triangles = item[0], item[1], item[2]
+            if surface.get("type") != "bspline":
+                continue
+            surface_new = extend_bspline_surface(surface, ext_v)
+            grid_new, tri_new = sample_surface_to_mesh(surface_new, ISOSURFACE_FIT_N_GRID)
+            if grid_new is None:
+                continue
+            self.batch_isosurface_meshes[idx] = (surface_new, grid_new, tri_new)
+            try:
+                self.plotter.remove_actor(self.batch_isosurface_actors[idx])
+            except Exception:
+                pass
+            faces = np.column_stack([np.full(tri_new.shape[0], 3, dtype=np.int32), tri_new]).ravel()
+            mesh = pv.PolyData(grid_new, faces)
+            actor = self.plotter.add_mesh(
+                mesh,
+                color=tuple(self.isosurface_color.tolist()),
+                opacity=self.isosurface_opacity,
+                lighting=True,
+                pickable=False,
+            )
+            self.batch_isosurface_actors[idx] = actor
+            extended_count += 1
+        self.lbl_info.setText(f"延展完成: {extended_count} 个 B-spline 等值面 (extV={ext_v:.2f})")
+        self.plotter.render()
 
     def _on_isosurface_filter_clicked(self):
         """筛选显示按钮：只显示 offset 在 [value-tol, value+tol] 内的点"""
@@ -1792,13 +2679,13 @@ class FaceHighlighterWindow(QMainWindow):
             self.lbl_info.setText(f"显示全部: {total} 个点")
 
     def _remove_isosurface_surface(self):
-        """移除拟合曲面"""
-        if self.isosurface_surface_actor is not None:
+        """移除单次拟合的所有曲面"""
+        for actor in self.isosurface_surface_actors:
             try:
-                self.plotter.remove_actor(self.isosurface_surface_actor)
+                self.plotter.remove_actor(actor)
             except Exception:
                 pass
-            self.isosurface_surface_actor = None
+        self.isosurface_surface_actors = []
 
     def _remove_batch_isosurfaces(self):
         """移除所有批量拟合曲面"""
@@ -1812,6 +2699,8 @@ class FaceHighlighterWindow(QMainWindow):
         self.batch_fit_done = False
         if hasattr(self, "btn_export_midsurf"):
             self.btn_export_midsurf.setEnabled(False)
+        if hasattr(self, "btn_isosurface_extend"):
+            self.btn_isosurface_extend.setEnabled(False)
 
     def _batch_fit_all_isosurfaces(self):
         """对所有面对批量拟合等值面并显示"""
@@ -1827,11 +2716,17 @@ class FaceHighlighterWindow(QMainWindow):
         self._remove_batch_isosurfaces()
         self._remove_isosurface_surface()
         offset_src = self.isosurface_offset_source
-        lo = self.isosurface_offset_value - self.isosurface_tolerance
-        hi = self.isosurface_offset_value + self.isosurface_tolerance
+        value = float(self.isosurface_offset_value)
+        tol = float(self.isosurface_tolerance)
+        use_new = getattr(self, "isosurface_new_behavior", False)
+        if use_new and abs(value - 0.5) >= 1e-9:
+            centers = [value, 1.0 - value]
+        else:
+            centers = [value]
         ok_count = 0
         skip_count = 0
-        for tags in self.face_tag_groups:
+        flip_cbs = getattr(self, "flip_checkboxes", [])
+        for row_i, tags in enumerate(self.face_tag_groups):
             if len(tags) != 2:
                 continue
             left_id, right_id = tags[0], tags[1]
@@ -1839,39 +2734,50 @@ class FaceHighlighterWindow(QMainWindow):
             if data is None:
                 skip_count += 1
                 continue
-            offset = np.asarray(data[offset_src])
+            offset = np.asarray(data[offset_src], dtype=np.float64)
+            if offset_src in ("offset_pred", "offset_gt") and row_i < len(flip_cbs) and flip_cbs[row_i].isChecked():
+                offset = 1.0 - offset
             validity_key = "validity_pred" if offset_src == "offset_pred" else "validity_gt"
             validity = np.asarray(data[validity_key]) if validity_key in data else None
-            mask = (offset >= lo) & (offset <= hi)
-            if validity is not None:
-                mask = mask & (validity == 1)
-            points = np.asarray(data["query_points_ws"])[mask]
-            if len(points) < 16:
-                skip_count += 1
-                continue
-            grid_points, triangles, info = fit_nurbs_surface_from_points(
-                points,
-                n_grid=ISOSURFACE_FIT_N_GRID,
-                smoothing=ISOSURFACE_FIT_SMOOTHING,
-            )
-            if grid_points is None:
-                skip_count += 1
-                continue
-            self.batch_isosurface_meshes.append((grid_points, triangles))
-            faces = np.column_stack([np.full(triangles.shape[0], 3, dtype=np.int32), triangles]).ravel()
-            mesh = pv.PolyData(grid_points, faces)
-            actor = self.plotter.add_mesh(
-                mesh,
-                color=tuple(self.isosurface_color.tolist()),
-                opacity=self.isosurface_opacity,
-                lighting=True,
-                pickable=False,
-            )
-            self.batch_isosurface_actors.append(actor)
-            ok_count += 1
+            for center in centers:
+                lo = center - tol
+                hi = center + tol
+                mask = (offset >= lo) & (offset <= hi)
+                if validity is not None:
+                    mask = mask & (validity > 0)
+                points = np.asarray(data["query_points_ws"])[mask]
+                if len(points) < 16:
+                    skip_count += 1
+                    continue
+                left_face = self.index_to_face.get(left_id) if getattr(self, "index_to_face", None) else None
+                right_face = self.index_to_face.get(right_id) if getattr(self, "index_to_face", None) else None
+                surface, info = fit_isosurface_by_face_type(
+                    points, left_face, right_face, n_grid=ISOSURFACE_FIT_N_GRID
+                )
+                if surface is None:
+                    skip_count += 1
+                    continue
+                grid_points, triangles = sample_surface_to_mesh(surface, ISOSURFACE_FIT_N_GRID)
+                if grid_points is None:
+                    skip_count += 1
+                    continue
+                self.batch_isosurface_meshes.append((surface, grid_points, triangles))
+                faces = np.column_stack([np.full(triangles.shape[0], 3, dtype=np.int32), triangles]).ravel()
+                mesh = pv.PolyData(grid_points, faces)
+                actor = self.plotter.add_mesh(
+                    mesh,
+                    color=tuple(self.isosurface_color.tolist()),
+                    opacity=self.isosurface_opacity,
+                    lighting=True,
+                    pickable=False,
+                )
+                self.batch_isosurface_actors.append(actor)
+                ok_count += 1
         self.batch_fit_done = ok_count > 0
         if hasattr(self, "btn_export_midsurf"):
             self.btn_export_midsurf.setEnabled(self.batch_fit_done)
+        if hasattr(self, "btn_isosurface_extend"):
+            self.btn_isosurface_extend.setEnabled(self.batch_fit_done)
         self.lbl_info.setText(
             f"批量拟合完成: {ok_count} 个等值面 | 跳过 {skip_count} 个面对"
         )
@@ -1896,10 +2802,15 @@ class FaceHighlighterWindow(QMainWindow):
             self.lbl_info.setText(f"获取 solid 失败: {e}")
             return
         shapes = [solid_shape]
-        for grid_points, triangles in self.batch_isosurface_meshes:
-            occ_shape = polydata_to_occ_shape(grid_points, triangles)
-            if occ_shape is not None:
-                shapes.append(occ_shape)
+        for item in self.batch_isosurface_meshes:
+            surface, grid_points, triangles = item[0], item[1], item[2]
+            occ_face = surface_to_occ_face(surface)
+            if occ_face is not None:
+                shapes.append(occ_face)
+            else:
+                occ_shape = polydata_to_occ_shape(grid_points, triangles)
+                if occ_shape is not None:
+                    shapes.append(occ_shape)
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
@@ -1914,7 +2825,11 @@ class FaceHighlighterWindow(QMainWindow):
             self.lbl_info.setText(f"STEP 导出失败: {out_path}")
 
     def _on_isosurface_fit_clicked(self):
-        """拟合按钮：对 offset∈[value-tol, value+tol] 的点进行 B-spline 曲面拟合并渲染"""
+        """拟合按钮：根据 offset 区间对当前面对进行等值面拟合并渲染。
+
+        旧行为（offset_value==0.5）：一次操作，显示一个曲面。
+        新行为（offset_value!=0.5）：两次操作（原区间 + 以 0.5 为中心的对称区间），同时显示两个结果曲面。
+        """
         if not self.point_cloud_data or self.isosurface_offset_source not in self.point_cloud_data:
             self.lbl_info.setText("无点云数据，请先加载面对点云")
             return
@@ -1922,37 +2837,60 @@ class FaceHighlighterWindow(QMainWindow):
         query_ws = self.point_cloud_data["query_points_ws"]
         validity_key = "validity_pred" if self.isosurface_offset_source == "offset_pred" else "validity_gt"
         validity = np.asarray(self.point_cloud_data[validity_key]) if validity_key in self.point_cloud_data else None
-        lo = self.isosurface_offset_value - self.isosurface_tolerance
-        hi = self.isosurface_offset_value + self.isosurface_tolerance
-        mask = (offset >= lo) & (offset <= hi)
-        if validity is not None:
-            mask = mask & (validity == 1)
-        points = np.asarray(query_ws)[mask]
-        if len(points) < 16:
-            self.lbl_info.setText(f"参与拟合的点数不足 ({len(points)} < 16)，请增大 tolerance 或调整 offset_value")
-            return
-        grid_points, triangles, info = fit_nurbs_surface_from_points(
-            points,
-            n_grid=ISOSURFACE_FIT_N_GRID,
-            smoothing=ISOSURFACE_FIT_SMOOTHING,
-        )
-        if grid_points is None:
-            self.lbl_info.setText("B-spline 拟合失败")
-            return
+        value = float(self.isosurface_offset_value)
+        tol = float(self.isosurface_tolerance)
+        use_new = getattr(self, "isosurface_new_behavior", False)
+        if use_new and abs(value - 0.5) >= 1e-9:
+            centers = [value, 1.0 - value]
+        else:
+            centers = [value]
+
+        left_face = self.index_to_face.get(self.current_face_pair[0]) if getattr(self, "current_face_pair", None) and getattr(self, "index_to_face", None) else None
+        right_face = self.index_to_face.get(self.current_face_pair[1]) if getattr(self, "current_face_pair", None) and getattr(self, "index_to_face", None) else None
+
         self._remove_isosurface_surface()
-        faces = np.column_stack([np.full(triangles.shape[0], 3, dtype=np.int32), triangles]).ravel()
-        mesh = pv.PolyData(grid_points, faces)
-        actor = self.plotter.add_mesh(
-            mesh,
-            color=tuple(self.isosurface_color.tolist()),
-            opacity=self.isosurface_opacity,
-            lighting=True,
-            pickable=False,
-        )
-        self.isosurface_surface_actor = actor
-        self.lbl_info.setText(
-            f"拟合完成: {info['n_input_points']} 点 → {info['n_grid']}×{info['n_grid']} 网格曲面"
-        )
+        success_count = 0
+        last_info = None
+
+        for center in centers:
+            lo = center - tol
+            hi = center + tol
+            mask = (offset >= lo) & (offset <= hi)
+            if validity is not None:
+                mask = mask & (validity > 0)
+            points = np.asarray(query_ws)[mask]
+            if len(points) < 16:
+                continue
+            surface, info = fit_isosurface_by_face_type(
+                points, left_face, right_face, n_grid=ISOSURFACE_FIT_N_GRID
+            )
+            if surface is None:
+                continue
+            grid_points, triangles = sample_surface_to_mesh(surface, ISOSURFACE_FIT_N_GRID)
+            if grid_points is None:
+                continue
+            faces = np.column_stack([np.full(triangles.shape[0], 3, dtype=np.int32), triangles]).ravel()
+            mesh = pv.PolyData(grid_points, faces)
+            actor = self.plotter.add_mesh(
+                mesh,
+                color=tuple(self.isosurface_color.tolist()),
+                opacity=self.isosurface_opacity,
+                lighting=True,
+                pickable=False,
+            )
+            self.isosurface_surface_actors.append(actor)
+            success_count += 1
+            last_info = info
+
+        if success_count == 0:
+            self.lbl_info.setText("等值面拟合失败：区间内有效点数不足或曲面拟合失败")
+            return
+        fit_type = last_info.get("type", "non-periodic") if last_info else "non-periodic"
+        n_input = last_info.get("n_input_points") if last_info and "n_input_points" in last_info else "?"
+        msg = f"拟合完成 ({fit_type}): {n_input} 点 → {ISOSURFACE_FIT_N_GRID}×{ISOSURFACE_FIT_N_GRID} 网格"
+        if success_count == 2:
+            msg += "（两个曲面已同时显示）"
+        self.lbl_info.setText(msg)
         self.plotter.render()
 
     def _get_filtered_point_count(self):
@@ -1966,8 +2904,166 @@ class FaceHighlighterWindow(QMainWindow):
         validity = np.asarray(self.point_cloud_data[validity_key])
         lo = self.isosurface_offset_value - self.isosurface_tolerance
         hi = self.isosurface_offset_value + self.isosurface_tolerance
-        mask = (offset >= lo) & (offset <= hi) & (validity == 1)
+        mask = (offset >= lo) & (offset <= hi) & (validity > 0)
         return int(np.sum(mask))
+
+    def _clear_point_cloud_actors_only(self):
+        """仅移除当前单面对点云的 actor，不清空 point_cloud_data（用于切换至概览前隐藏单面对点云）"""
+        for actor in self.point_cloud_actors:
+            try:
+                self.plotter.remove_actor(actor)
+            except Exception:
+                pass
+        self.point_cloud_actors.clear()
+
+    def _clear_overview_point_clouds(self):
+        """移除概览模式下所有面对的点云 actor，并清除实时重着色用的缓存"""
+        for actor in self.overview_point_cloud_actors:
+            try:
+                self.plotter.remove_actor(actor)
+            except Exception:
+                pass
+        self.overview_point_cloud_actors.clear()
+        for attr in ("_overview_pair_data", "_overview_global_vmin", "_overview_global_vmax", "_overview_albedo_key"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+    def _create_overview_point_clouds(self):
+        """概览模式：为每个面对加载点云并按配额采样后显示，颜色与 Model/Solo 一致，由点的 o/v 映射到 albedo 颜色条。
+        每面对最大点数由文件顶部常量 OVERVIEW_POINTS_PER_PAIR 控制（默认 400）。"""
+        if not self.config_dir or not self.config_name or not getattr(self, "face_tag_groups", None):
+            return
+        # 与单面对点云一致的数据源（offset_pred/offset_gt/validity_pred/validity_gt）
+        key = self.combo_albedo_source.currentData() if hasattr(self, "combo_albedo_source") else None
+        if not key:
+            key = "offset_pred"
+        extent = getattr(self, "model_extent", 1.0) or 1.0
+        base_radius = extent * 0.0008
+        scale = getattr(self, "point_cloud_radius_scale", 1.0)
+        sphere_radius = base_radius * scale
+        sphere_geom = pv.Sphere(radius=sphere_radius, theta_resolution=5, phi_resolution=5)
+        op = getattr(self, "point_cloud_opacity", 0.9)
+
+        # 第一遍：收集 (row_i, pts, scalars_raw)，scalars_raw 为未取反的标量；并计算全局 vmin/vmax（按当前取反状态）
+        all_scalars = []
+        pair_data_list = []
+        flip_cbs = getattr(self, "flip_checkboxes", [])
+        for i, tags in enumerate(self.face_tag_groups):
+            if len(tags) != 2:
+                continue
+            left_id, right_id = tags[0], tags[1]
+            data = self._load_point_cloud_data_for_pair(left_id, right_id)
+            if data is None or "query_points_ws" not in data or key not in data:
+                continue
+            pts = np.asarray(data["query_points_ws"], dtype=np.float64)
+            scalars_raw = np.asarray(data[key], dtype=np.float64)
+            if len(pts) == 0 or len(scalars_raw) != len(pts):
+                continue
+            pair_data_list.append((i, pts, scalars_raw))
+            scalars_display = (1.0 - scalars_raw) if (key in ("offset_pred", "offset_gt") and i < len(flip_cbs) and flip_cbs[i].isChecked()) else scalars_raw
+            all_scalars.append(scalars_display)
+        if not pair_data_list:
+            return
+        all_scalars = np.concatenate(all_scalars)
+        vmin, vmax = float(np.min(all_scalars)), float(np.max(all_scalars))
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+        self._overview_global_vmin = vmin
+        self._overview_global_vmax = vmax
+        self._overview_albedo_key = key
+
+        # 第二遍：按配额采样、着色，并保存 (row_i, actor, pts_s, scalars_raw_s) 供取反时实时重着色
+        self._overview_pair_data = []
+        for row_i, pts, scalars_raw in pair_data_list:
+            n = len(pts)
+            quota = min(n, OVERVIEW_POINTS_PER_PAIR)
+            if n > quota:
+                rng = np.random.default_rng(42)
+                idx = rng.choice(n, size=quota, replace=False)
+                pts_s = pts[idx]
+                scalars_raw_s = scalars_raw[idx]
+            else:
+                pts_s = pts
+                scalars_raw_s = scalars_raw
+            flip = key in ("offset_pred", "offset_gt") and row_i < len(flip_cbs) and flip_cbs[row_i].isChecked()
+            scalars = (1.0 - scalars_raw_s) if flip else scalars_raw_s
+            t = (scalars - vmin) / (vmax - vmin)
+            t = np.clip(t, 0, 1)
+            colors = self._albedo_interp_three(t)
+            colors = (np.clip(colors, 0, 1) * 255).astype(np.uint8)
+            pc_mesh = pv.PolyData(pts_s)
+            pc_mesh["colors"] = colors
+            glyph_mesh = pc_mesh.glyph(scale=False, orient=False, geom=sphere_geom)
+            actor = self.plotter.add_mesh(
+                glyph_mesh,
+                scalars="colors",
+                rgb=True,
+                lighting=False,
+                pickable=False,
+            )
+            actor.prop.opacity = op
+            self.overview_point_cloud_actors.append(actor)
+            self._overview_pair_data.append((row_i, actor, pts_s.copy(), scalars_raw_s.copy()))
+            mapper = actor.GetMapper()
+            if mapper and mapper.GetInput():
+                mapper.SetScalarModeToUsePointFieldData()
+                mapper.SelectColorArray("colors")
+                mapper.SetLookupTable(None)
+                mapper.SetColorModeToDirectScalars()
+        if self.overview_point_cloud_actors:
+            self.plotter.render()
+
+    def _recolor_overview_pair(self, row_index):
+        """概览模式下，对指定行（面对）的代表性点云按当前取反状态重新着色，实现实时更新。"""
+        pair_data = getattr(self, "_overview_pair_data", None)
+        if not pair_data:
+            return
+        vmin = getattr(self, "_overview_global_vmin", None)
+        vmax = getattr(self, "_overview_global_vmax", None)
+        key = getattr(self, "_overview_albedo_key", "offset_pred")
+        if vmin is None or vmax is None or vmax <= vmin:
+            return
+        flip_cbs = getattr(self, "flip_checkboxes", [])
+        extent = getattr(self, "model_extent", 1.0) or 1.0
+        base_radius = extent * 0.0008
+        scale = getattr(self, "point_cloud_radius_scale", 1.0)
+        sphere_radius = base_radius * scale
+        sphere_geom = pv.Sphere(radius=sphere_radius, theta_resolution=5, phi_resolution=5)
+        op = getattr(self, "point_cloud_opacity", 0.9)
+        for idx, (row_i, old_actor, pts_s, scalars_raw_s) in enumerate(pair_data):
+            if row_i != row_index:
+                continue
+            try:
+                self.plotter.remove_actor(old_actor)
+            except Exception:
+                pass
+            flip = key in ("offset_pred", "offset_gt") and row_index < len(flip_cbs) and flip_cbs[row_index].isChecked()
+            scalars = (1.0 - scalars_raw_s) if flip else scalars_raw_s
+            t = (scalars - vmin) / (vmax - vmin)
+            t = np.clip(t, 0, 1)
+            colors = self._albedo_interp_three(t)
+            colors = (np.clip(colors, 0, 1) * 255).astype(np.uint8)
+            pc_mesh = pv.PolyData(pts_s)
+            pc_mesh["colors"] = colors
+            glyph_mesh = pc_mesh.glyph(scale=False, orient=False, geom=sphere_geom)
+            new_actor = self.plotter.add_mesh(
+                glyph_mesh,
+                scalars="colors",
+                rgb=True,
+                lighting=False,
+                pickable=False,
+            )
+            new_actor.prop.opacity = op
+            mapper = new_actor.GetMapper()
+            if mapper and mapper.GetInput():
+                mapper.SetScalarModeToUsePointFieldData()
+                mapper.SelectColorArray("colors")
+                mapper.SetLookupTable(None)
+                mapper.SetColorModeToDirectScalars()
+            self._overview_pair_data[idx] = (row_i, new_actor, pts_s, scalars_raw_s)
+            self.overview_point_cloud_actors[idx] = new_actor
+            self.plotter.render()
+            return
 
     def _refresh_point_cloud_display(self):
         """根据当前筛选状态重建点云显示"""
@@ -2000,8 +3096,12 @@ class FaceHighlighterWindow(QMainWindow):
             self.plotter.render()
 
     def _on_albedo_source_changed(self):
-        """Albedo 数据源切换时更新点云颜色"""
-        self._update_point_cloud_colors()
+        """Albedo 数据源切换时更新点云颜色；概览模式下重建概览点云以应用新数据源"""
+        if getattr(self, "combo_render_mode", None) is not None and self.combo_render_mode.currentIndex() == 2:
+            self._clear_overview_point_clouds()
+            self._create_overview_point_clouds()
+        else:
+            self._update_point_cloud_colors()
 
     def _load_point_cloud_data_for_pair(self, left_id, right_id):
         """
@@ -2183,10 +3283,50 @@ class FaceHighlighterWindow(QMainWindow):
             "query_points_ws": query_points_ws,
         }
         self.current_face_pair = (left_id, right_id)
+        # 若该行“反”已勾选，则对刚加载的 offset 做 1-offset，与列表状态一致
+        row_i = self._get_row_index_for_pair(left_id, right_id)
+        if (
+            row_i is not None
+            and row_i < len(getattr(self, "flip_checkboxes", []))
+            and self.flip_checkboxes[row_i].isChecked()
+        ):
+            for key in ("offset_pred", "offset_gt"):
+                if key in self.point_cloud_data:
+                    arr = np.asarray(self.point_cloud_data[key], dtype=np.float64)
+                    self.point_cloud_data[key] = 1.0 - arr
+        self._log_offset_distribution()
         self._sync_isosurface_offset_range()
         self._create_point_cloud_glyphs()
         self.plotter.render()
         return True
+
+    def _log_offset_distribution(self):
+        """统计点云 offset 各区间分布并输出（在每次加载点云数据时调用一次）"""
+        if not self.point_cloud_data:
+            return
+        n_bins = 20
+        for key in ("offset_pred", "offset_gt"):
+            if key not in self.point_cloud_data:
+                continue
+            arr = np.asarray(self.point_cloud_data[key], dtype=np.float64)
+            if len(arr) == 0:
+                continue
+            lo, hi = float(np.min(arr)), float(np.max(arr))
+            if hi <= lo:
+                edges = np.array([lo, lo + 1e-9])
+                counts, _ = np.histogram(arr, bins=edges)
+            else:
+                edges = np.linspace(lo, hi, n_bins + 1)
+                counts, _ = np.histogram(arr, bins=edges)
+            total = int(np.sum(counts))
+            label = "offset_pred (预测)" if key == "offset_pred" else "offset_gt (真值)"
+            print(f"[Offset 分布] {label}: 区间数={len(edges)-1}, 总数={total}, 范围=[{lo:.6g}, {hi:.6g}]")
+            for i in range(len(counts)):
+                a, b = edges[i], edges[i + 1]
+                c = int(counts[i])
+                pct = (100.0 * c / total) if total else 0
+                print(f"  [{a:.6g}, {b:.6g}): {c:6d} ({pct:5.2f}%)")
+            print()
 
     def _sync_isosurface_offset_range(self):
         """根据当前点云 offset 数据同步等值 offset_value 范围"""
@@ -2220,7 +3360,7 @@ class FaceHighlighterWindow(QMainWindow):
             hi = self.isosurface_offset_value + self.isosurface_tolerance
             mask = (offset >= lo) & (offset <= hi)
             if validity is not None:
-                mask = mask & (validity == 1)
+                mask = mask & (validity > 0)
             if not np.any(mask):
                 return
             query_points_ws = query_points_ws[mask]
@@ -2290,7 +3430,21 @@ class FaceHighlighterWindow(QMainWindow):
             return
         
         face_id = self.actor_to_face_id[picked_actor]
-        solo = self.slider_solo.value() if hasattr(self, "slider_solo") else 0
+        solo = self.combo_render_mode.currentIndex() if hasattr(self, "combo_render_mode") else 0
+
+        # 概览模式：点选面对仅更新选中与 OBB，不加载单面对点云
+        if solo == 2:
+            face_pair = None
+            for tags in self.face_tag_groups:
+                if len(tags) == 2 and face_id in tags:
+                    face_pair = (tags[0], tags[1])
+                    break
+            if face_pair:
+                left_id, right_id = face_pair
+                self.current_face_pair = (left_id, right_id)
+                self._apply_solo_mode()
+                self.lbl_info.setText(f"概览: 已选中面对 [{left_id}, {right_id}]，OBB 已更新")
+                return
         
         # STF 模式（仅 model mode）：点选面切换其在透明面列表中的状态
         if solo == 0 and getattr(self, "stf_mode", False):
